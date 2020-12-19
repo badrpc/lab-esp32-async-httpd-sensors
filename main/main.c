@@ -18,6 +18,9 @@
 #include "esp_eth.h"
 #include "protocol_examples_common.h"
 
+#include <freertos/task.h>
+#include <freertos/semphr.h>
+
 #include <libesphttpd/httpd.h>
 #include <libesphttpd/route.h>
 #include <libesphttpd/httpd-freertos.h>
@@ -26,9 +29,121 @@
 #include <driver/gpio.h>
 #include "sas8.h"
 
-/* A simple example that demonstrates how to create GET and POST
- * handlers for the web server.
- */
+static volatile QueueHandle_t sas8RequestQueue = NULL;
+
+typedef struct {
+    // // operation
+    // // operation arg
+    // // callback
+    // // callback arg
+
+    TaskHandle_t task;
+    SemaphoreHandle_t done;
+} sas8Request;
+
+typedef struct {
+    esp_err_t err;
+    uint16_t status;
+    uint16_t co2;
+} sas8StatusCO2Response;
+
+static void sas8Gatekeeper(void *arg) {
+    QueueHandle_t queue = (QueueHandle_t)arg;
+    // TODO: check queue != NULL
+    if (queue == NULL) {
+        ESP_LOGE("sas8Gatekeeper", "queue == NULL");
+        abort();
+    }
+    sas8Request req;
+    for(;;) {
+        xQueueReceive(queue, &req, portMAX_DELAY);
+        ESP_LOGI("sas8Gatekeeper", "new request");
+
+        esp_err_t err = ESP_FAIL;
+        uint16_t status=0, co2=0;
+        sas8StatusCO2Response *response = NULL;
+
+        // If req.done already reached 0 it means that request has already
+        // timed out. Presumably by sitting in the queue for too long. There's
+        // no need to execute operation and task should proceed directly to
+        // resource cleanup.
+        if (uxSemaphoreGetCount(req.done) > 0) {
+            err = sas8ReadStatusCO2(104, &status, &co2);
+        }
+
+        if (xSemaphoreTake(req.done, 0) == pdTRUE) {
+            // This task was first to take the semaphore so it should send the
+            // notification to the task requested sensor readings.  Any
+            // resources allocated in this function outside this branch must be
+            // released locally.
+            if ((response=malloc(sizeof(sas8StatusCO2Response))) != NULL) {
+                ESP_LOGI("heap", "+ %p", response);
+                response->err = err;
+                response->status = status;
+                response->co2 = co2;
+            }
+            if (xTaskNotify(req.task, (uint32_t)response, eSetValueWithoutOverwrite) == pdFAIL) {
+                ESP_LOGI("sas8Gatekeeper", "xTaskNotify(): pdFAIL");
+            }
+        } else {
+            // This task was too late and request timed out in the requesting
+            // task. Do not send data back. Delete the semaphore.
+            ESP_LOGE("sas8Gatekeeper", "request timed out");
+            vSemaphoreDelete(req.done);
+        }
+    }
+}
+
+static esp_err_t sas8KeeperRead(QueueHandle_t queue, TickType_t xTicksToWait, uint16_t *status, uint16_t *co2) {
+    sas8Request req = {
+      .task = xTaskGetCurrentTaskHandle(),
+      .done = xSemaphoreCreateBinary(),
+    };
+    if (req.done == NULL) {
+        ESP_LOGE("sas8Read", "xSemaphoreCreateBinary(): NULL");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (xSemaphoreGive(req.done) != pdPASS) {
+        ESP_LOGE("sas8Read", "xSemaphoreGive(): !pdPASS");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xQueueSend(queue, &req, 0) != pdPASS) {
+        ESP_LOGE("sas8Read", "xQueueSend(): !pdPASS");
+        vSemaphoreDelete(req.done);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    sas8StatusCO2Response *response;
+    BaseType_t waitRes = xTaskNotifyWait(0, 0, (uint32_t*)&response, xTicksToWait);
+    if (xSemaphoreTake(req.done, 0) == pdTRUE) {
+        // This task was first to take the semaphore meaning request timed
+        // out. This task should not delete the semaphore because gatekeeper
+        // task will try to take it later, will realise request timed out
+        // and will delete the semaphore.
+        return ESP_ERR_TIMEOUT;
+    }
+    // Gatekeeper task was the first to take the semaphore. This task
+    // should delete the semaphore. It is still possible that request
+    // timed out if waitRes != pdTRUE.
+    vSemaphoreDelete(req.done);
+    ESP_LOGI("sas8Read", "received: %p", response);
+    if (waitRes != pdTRUE) {
+        if (response != NULL) {
+            free(response);
+            ESP_LOGI("heap", "- %p", response);
+        }
+        return ESP_ERR_TIMEOUT;
+    }
+    if (response == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    *status = response->status;
+    *co2 = response->co2;
+    esp_err_t err = response->err;
+    free(response);
+    ESP_LOGI("heap", "- %p", response);
+    return err;
+}
 
 static const char *TAG = "example";
 
@@ -64,8 +179,9 @@ CgiStatus ICACHE_FLASH_ATTR handleMetrics(HttpdConnData *connData) {
         return HTTPD_CGI_DONE;
     }
 
+    ESP_LOGI(LOG_TAG, "sending request");
     uint16_t status, co2;
-    esp_err_t err = sas8ReadStatusCO2(104, &status, &co2);
+    esp_err_t err = sas8KeeperRead(sas8RequestQueue, pdMS_TO_TICKS(150), &status, &co2);
     if (err != ESP_OK) {
         ESP_LOGE(LOG_TAG, "sas8ReadStatusCO2(...) err: 0x%x (%s).",
                  (int)err, (char*)esp_err_to_name(err));
@@ -163,10 +279,16 @@ static esp_err_t master_init(void)
     return err;
 }
 
-
 void app_main(void)
 {
     ESP_ERROR_CHECK(master_init());
+
+    sas8RequestQueue = xQueueCreate(16, sizeof(sas8Request));
+    if (sas8RequestQueue == NULL) {
+        ESP_LOGE("main", "sas8RequestQueue == NULL");
+        abort();
+    }
+    xTaskCreate(sas8Gatekeeper, "sas8Gatekeeper", 2048, (void *)sas8RequestQueue, 1, NULL);
 
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
