@@ -287,6 +287,7 @@ static void GatekeeperTask(void *arg) {
         // cleanup.
         if (uxSemaphoreGetCount(req->sync) < 1) {
             ESP_LOGE(log_tag, "request timed out early");
+            ESP_LOGI("semaphore", "- %p", req->sync);
             vSemaphoreDelete(req->sync);
             continue;
         }
@@ -423,6 +424,7 @@ bool gkExecDone(GKRequest *req, void *result) {
         // This task was too late and request timed out. This side is
         // responsible for deleting the sync semaphore.
         ESP_LOGE(log_tag, "request timed out");
+        ESP_LOGI("semaphore", "- %p", req->sync);
         vSemaphoreDelete(req->sync);
         return false;
     }
@@ -439,12 +441,12 @@ bool gkExecDone(GKRequest *req, void *result) {
     return true;
 }
 
-static void GKTimeout(TimerHandle_t xTimer) {
+static void gkTimeout(TimerHandle_t xTimer) {
     static const char* log_tag = __func__;
     GKRequest *req = (GKRequest *)pvTimerGetTimerID(xTimer);
     if (req == NULL) {
         ESP_LOGE(log_tag, "req == NULL");
-        abort();
+        return;
     }
     if (req->response_size < sizeof(GKResponseError)) {
         ESP_LOGE(log_tag, "req->response_size < sizeof(GKResponseError)");
@@ -456,6 +458,7 @@ static void GKTimeout(TimerHandle_t xTimer) {
         // notifying the done semaphore. All that's left to be done here is to
         // delete the sync semaphore and free memory allocated to timer
         // request.
+        ESP_LOGI("semaphore", "- %p", req->sync);
         vSemaphoreDelete(req->sync);
     } else {
         // Timer task came first to taking the sync semaphore meaning that the
@@ -469,11 +472,56 @@ static void GKTimeout(TimerHandle_t xTimer) {
     // Timer gets a dedicated copy of request which it should delete when done.
     ESP_LOGI("heap", "- %p", req);
     free(req);
-    // TODO: find the way to delete timer.
-    if (xTimerDelete(xTimer, 0) != pdPASS) {
-        ESP_LOGE(log_tag, "xTimerDelete(): !pdPASS");
+    // Setting Timer ID to NULL is used to signal that timer has already fired
+    // and associated request and sync semaphore has been handled. This is
+    // later used by gkTimerCancelFunc to correctly identify resources to
+    // release.
+    vTimerSetTimerID(xTimer, NULL);
+}
+
+// gkTimerCancelFunc deletes the gatekeeper timeout timer. It must execute in
+// the context of FreeRTOS timer task to ensure serialised execution of
+// gkTimeout and gkTimerCancelFunc.
+static void gkTimerCancelFunc(void *timerParam, uint32_t param2) {
+    static const char* log_tag = __func__;
+    TimerHandle_t timer = timerParam;
+    if (timer == NULL) {
+        ESP_LOGE(log_tag, "timer == NULL");
         abort();
     }
+
+    GKRequest *req = (GKRequest *)pvTimerGetTimerID(timer);
+
+    // Timer removal is a deferred operation - xTimerDelete only queues request
+    // to delete the timer but does not delete it immediately. So even though
+    // we call xTimerDelete here it is still possible for timer to expire and
+    // execute gkTimeout. Setting TimerID to NULL here ensures that gkTimeout
+    // won't attempt to free memory and delete sync semaphore second time.
+    vTimerSetTimerID(timer, NULL);
+
+    ESP_LOGI("timer", "- %p", timer);
+    if (xTimerDelete(timer, 0) != pdPASS) {
+        ESP_LOGE(log_tag, "xTimerDelete() != pdPASS");
+    }
+
+    if (req == NULL) {
+        // Timer has already fired and handled sync semaphore and request. All
+        // that's left is to delete timer itself.
+        return;
+    }
+
+    // The following requires that the task doing the "real work" always
+    // finishes correctly and handle sync semaphore deletion if needed.
+    if (xSemaphoreTake(req->sync, 0) != pdTRUE) {
+        ESP_LOGI("semaphore", "- %p", req->sync);
+        vSemaphoreDelete(req->sync);
+    }
+    ESP_LOGI("heap", "- %p", req);
+    free(req);
+}
+
+static BaseType_t GKTimerCancel(TimerHandle_t timer) {
+    return xTimerPendFunctionCall(gkTimerCancelFunc, timer, 0, 0);
 }
 
 static volatile GKTaskArgs sas8GKArgs;
@@ -532,12 +580,13 @@ static esp_err_t SAS8ReadStatusCO2Async(TickType_t xTicksToWait, QueueHandle_t *
     request->args.sensor_addr = 104;
 
     // // // // // // // // //
-    *tTimeout = xTimerCreate("gatekeeper timeout", xTicksToWait, pdFALSE /* uxAutoReload */, request, GKTimeout);
+    *tTimeout = xTimerCreate("gatekeeper timeout", xTicksToWait, pdFALSE /* uxAutoReload */, request, gkTimeout);
     if (*tTimeout == NULL) {
         // TODO: release resources
         ESP_LOGE(log_tag, "xTimerCreate(): NULL");
         return ESP_ERR_NO_MEM;
     }
+    ESP_LOGI("timer", "+ %p", *tTimeout);
     if (xTimerStart(*tTimeout, 0) != pdPASS) {
         ESP_LOGE(log_tag, "xTimerStart(tTimeout): !pdPASS");
         // TODO: release resources
@@ -550,12 +599,14 @@ static esp_err_t SAS8ReadStatusCO2Async(TickType_t xTicksToWait, QueueHandle_t *
         // TODO
     }
     request->gk_req.response_q = *response_q;
+    ESP_LOGI("queue", "+ %p", *response_q);
 
     // // // // // // // // //
     request->gk_req.sync = xSemaphoreCreateBinary();
     if (request->gk_req.sync == NULL) {
         // TODO
     }
+    ESP_LOGI("semaphore", "+ %p", request->gk_req.sync);
     if (xSemaphoreGive(request->gk_req.sync) != pdPASS) {
         // TODO: release resources
         ESP_LOGE(log_tag, "xSemaphoreGive(req.sync): !pdPASS");
@@ -622,6 +673,9 @@ CgiStatus ICACHE_FLASH_ATTR handleMetrics(HttpdConnData *connData) {
         ESP_LOGE(LOG_TAG, "xSemaphoreTake(done): !pdPASS");
         abort();
     }
+    GKTimerCancel(tTimeout);
+    vQueueDelete(done);
+    ESP_LOGI("queue", "- %p", done);
     if (response.gk_resp.err != ESP_OK) {
         ESP_LOGE(LOG_TAG, "response.err: 0x%x (%s).",
                  (int)err, (char*)esp_err_to_name(err));
@@ -629,11 +683,6 @@ CgiStatus ICACHE_FLASH_ATTR handleMetrics(HttpdConnData *connData) {
         httpdEndHeaders(connData);
         return HTTPD_CGI_DONE;
     }
-    // TODO: find the way to delete timer.
-    // if (xTimerDelete(tTimeout, 0) != pdPASS) {
-    //     ESP_LOGE(LOG_TAG, "xTimerDelete(tTimeout): !pdPASS");
-    //     abort();
-    // }
     ESP_LOGI(LOG_TAG, "Status: 0x%04x; CO2: % 4d", response.result.status, response.result.co2);
 
     httpdStartResponse(connData, 200);
