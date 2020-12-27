@@ -29,164 +29,6 @@
 #include <driver/gpio.h>
 #include "sas8.h"
 
-#if 0
-typedef struct {
-    sas8StatusCO2Response *response;
-    SemaphoreHandle_t sync;
-    SemaphoreHandle_t done;
-} sas8StatusCO2Request;
-
-static void sas8Gatekeeper(void *arg) {
-    QueueHandle_t queue = (QueueHandle_t)arg;
-    if (queue == NULL) {
-        ESP_LOGE("sas8Gatekeeper", "queue == NULL");
-        abort();
-    }
-    sas8StatusCO2Request req;
-    for (;;) {
-        xQueueReceive(queue, &req, portMAX_DELAY);
-
-        ESP_LOGI("sas8Gatekeeper", "new request");
-
-        // If req.sync reached 0 then this request has already timed out.
-        // Presumably by sitting in the queue for too long. There's no need to
-        // execute operation and task should proceed directly to resource
-        // cleanup.
-        if (uxSemaphoreGetCount(req.sync) < 1) {
-            ESP_LOGE("sas8Gatekeeper", "request timed out early");
-#if 0
-        } else if (response == NULL) {
-            // TODO: in generic gatekeeper pass response directly into the
-            // operation and omit this check.
-            ESP_LOGE("sas8Gatekeeper", "request->response is NULL");
-#endif
-        } else {
-            ESP_LOGI("sas8Gatekeeper", "+ sas8ReadStatusCO2");
-            esp_err_t err;
-            uint16_t status=0, co2=0;
-            err = sas8ReadStatusCO2(104, &status, &co2);
-            ESP_LOGI("sas8Gatekeeper", "- sas8ReadStatusCO2");
-            if (err != ESP_OK) {
-                ESP_LOGE("sas8Gatekeeper", "sas8ReadStatusCO2(...) err: 0x%x (%s).",
-                         (int)err, (char*)esp_err_to_name(err));
-            }
-            ESP_LOGI("sas8Gatekeeper", "Status: 0x%04x; CO2: % 4d", status, co2);
-        }
-
-        if (xSemaphoreTake(req.sync, 0) == pdTRUE) {
-            // Gatekeeper task was first to take the sync semaphore meaning
-            // that timeout timer hasn't fired yet. In this case the gatekeeper
-            // task is responsible to write the result and signal the done
-            // channel. Timeout timer is responsible for deleting the sync
-            // semaphore.
-            // TODO: implement writing request.
-            if (xSemaphoreGive(req.done) != pdPASS) {
-                ESP_LOGI("sas8Gatekeeper", "xSemaphoreGive(req.wait): !pdPASS");
-                abort();
-            }
-        } else {
-            // This task was too late and request timed out. This side is
-            // responsible for deleting the sync semaphore.
-            ESP_LOGE("sas8Gatekeeper", "request timed out");
-            vSemaphoreDelete(req.sync);
-        }
-    }
-}
-
-// TODO: Also need a function to cancel timer.
-static void gatekeeperTimeout(TimerHandle_t xTimer) {
-    sas8StatusCO2Request *req = (sas8StatusCO2Request*) pvTimerGetTimerID(xTimer);
-    if (req == NULL) {
-        ESP_LOGE("gatekeeperTimeout", "req: NULL");
-        abort();
-    }
-    if (xSemaphoreTake(req->sync, 0) != pdTRUE) {
-        // Sync semaphore has already been taken meaning that the gatekeeper
-        // task was faster. In this case the gatekeeper task is responsible for
-        // notifying the done semaphore. All that's left to be done here is to
-        // delete the sync semaphore and free memory allocated to timer
-        // request.
-        vSemaphoreDelete(req->sync);
-    } else {
-        // Timer task came first to taking the sync semaphore meaning that the
-        // gatekeeper task was too slow and we're dealing with a timeout. We
-        // should reflect timeout state in the response and notify the done
-        // channel. The gatekeeper task will be responsible for deleting the
-        // sync semaphore.
-        // TODO: Implement writing to the response.
-        if (xSemaphoreGive(req->done) != pdPASS) {
-            ESP_LOGE("gatekeeperTimeout", "xSemaphoreGive(req->done): !pdPASS");
-            abort();
-        }
-    }
-    // Timer gets a dedicated copy of request which it should delete when done.
-    ESP_LOGI("heap", "- %p", req);
-    free(req);
-    // TODO: find the way to delete timer.
-    if (xTimerDelete(xTimer, 0) != pdPASS) {
-        ESP_LOGE("gatekeeperTimeout", "xTimerDelete(): !pdPASS");
-        abort();
-    }
-}
-
-static esp_err_t sas8KeeperReadAsync(QueueHandle_t queue, TickType_t xTicksToWait, SemaphoreHandle_t *done, TimerHandle_t *tTimeout) {
-    sas8StatusCO2Request *req = malloc(sizeof(sas8StatusCO2Request));
-    if (req == NULL) {
-        ESP_LOGE("sas8Read", "malloc(sizeof(sas8StatusCO2Request)): NULL");
-        return ESP_ERR_NO_MEM;
-    }
-    ESP_LOGI("heap", "+ %p", req);
-    req->sync = xSemaphoreCreateBinary();
-    req->done = xSemaphoreCreateBinary();
-    // TODO: implement response.
-    // req->response = malloc(sizeof(sas8StatusCO2Response)),
-    // TODO: check all allocated
-
-    if (xSemaphoreGive(req->sync) != pdPASS) {
-        // TODO: release resources
-        ESP_LOGE("sas8Read", "xSemaphoreGive(req.sync): !pdPASS");
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    *done = req->done;
-
-    *tTimeout = xTimerCreate("gatekeeper timeout", xTicksToWait, pdFALSE /* uxAutoReload */, req, gatekeeperTimeout);
-    if (*tTimeout == NULL) {
-        // TODO: release resources
-        ESP_LOGE("sas8Read", "xTimerCreate(): NULL");
-        return ESP_ERR_NO_MEM;
-    }
-    if (xTimerStart(*tTimeout, 0) != pdPASS) {
-        ESP_LOGE("sas8Read", "xTimerStart(tTimeout): !pdPASS");
-        // TODO: release resources
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    if (xQueueSend(queue, req, 0) != pdPASS) {
-        ESP_LOGE("sas8Read", "xQueueSend(): !pdPASS");
-        // TODO: release resources
-        return ESP_ERR_INVALID_STATE;
-    }
-    return ESP_OK;
-}
-
-static esp_err_t sas8ReadStatusCO2GK(QueueHandle_t q) {
-}
-
-static esp_err_t GatekeeperRequest() {
-}
-
-static esp_err_t GatekeeperRequestQ() {
-    static const char* log_tag = "GatekeeperRequestQ";
-    if (xQueueSend(q, req, 0) != pdPASS) {
-        ESP_LOGE(log_tag, "xQueueSend() != pdPASS");
-        return ESP_ERR_INVALID_STATE;
-    }
-    return ESP_OK;
-}
-
-#endif
-
 // Note on terminology
 //
 // Request is full request to gatekeeper task including technical header.
@@ -634,10 +476,9 @@ static void connect_handler(void* arg, esp_event_base_t event_base,
     ESP_LOGI(__func__, "connect_handler");
 }
 
-#define LOG_TAG "sas8"
-
 CgiStatus ICACHE_FLASH_ATTR handleMetrics(HttpdConnData *connData) {
-    ESP_LOGI("handleMetrics", "+");
+    static const char* log_tag = __func__;
+    ESP_LOGI(log_tag, "+");
 
     // If the browser unexpectedly closes the connection, the CGI will be
     // called after the isConnectionClosed flag is set. We can use this to
@@ -654,7 +495,7 @@ CgiStatus ICACHE_FLASH_ATTR handleMetrics(HttpdConnData *connData) {
         return HTTPD_CGI_DONE;
     }
 
-    ESP_LOGI(LOG_TAG, "sending request");
+    ESP_LOGI(log_tag, "sending request");
     // uint16_t status=0, co2=0;
 
     // // // // // // // // //
@@ -662,7 +503,7 @@ CgiStatus ICACHE_FLASH_ATTR handleMetrics(HttpdConnData *connData) {
     TimerHandle_t tTimeout;
     esp_err_t err = SAS8ReadStatusCO2Async(pdMS_TO_TICKS(150), &done, &tTimeout);
     if (err != ESP_OK) {
-        ESP_LOGE(LOG_TAG, "sas8ReadStatusCO2(...) err: 0x%x (%s).",
+        ESP_LOGE(log_tag, "sas8ReadStatusCO2(...) err: 0x%x (%s).",
                  (int)err, (char*)esp_err_to_name(err));
         httpdStartResponse(connData, 503);
         httpdEndHeaders(connData);
@@ -670,20 +511,20 @@ CgiStatus ICACHE_FLASH_ATTR handleMetrics(HttpdConnData *connData) {
     }
     SAS8GKStatusCO2Response response;
     if (xQueueReceive(done, &response, portMAX_DELAY) != pdPASS) {
-        ESP_LOGE(LOG_TAG, "xSemaphoreTake(done): !pdPASS");
+        ESP_LOGE(log_tag, "xSemaphoreTake(done): !pdPASS");
         abort();
     }
     GKTimerCancel(tTimeout);
     vQueueDelete(done);
     ESP_LOGI("queue", "- %p", done);
     if (response.gk_resp.err != ESP_OK) {
-        ESP_LOGE(LOG_TAG, "response.err: 0x%x (%s).",
+        ESP_LOGE(log_tag, "response.err: 0x%x (%s).",
                  (int)err, (char*)esp_err_to_name(err));
         httpdStartResponse(connData, 503);
         httpdEndHeaders(connData);
         return HTTPD_CGI_DONE;
     }
-    ESP_LOGI(LOG_TAG, "Status: 0x%04x; CO2: % 4d", response.result.status, response.result.co2);
+    ESP_LOGI(log_tag, "Status: 0x%04x; CO2: % 4d", response.result.status, response.result.co2);
 
     httpdStartResponse(connData, 200);
     httpdHeader(connData, "Content-Type", "text/plain");
@@ -693,7 +534,7 @@ CgiStatus ICACHE_FLASH_ATTR handleMetrics(HttpdConnData *connData) {
     int len=sprintf(output, "# HELP concentration_ppm CO2 concentration (ppm).\n# TYPE concentration_ppm gauge\nconcentration_ppm{substance=\"co2\"} %d\n", response.result.co2);
     httpdSend(connData, output, len);
 
-    ESP_LOGI("handleMetrics", "-");
+    ESP_LOGI(log_tag, "-");
 
     // If you need to suspend the HTTP response and resume it asynchronously
     // for some other reason, you may save the HttpdConnData pointer, return
@@ -706,50 +547,37 @@ CgiStatus ICACHE_FLASH_ATTR handleMetrics(HttpdConnData *connData) {
 
     // All done.
     return HTTPD_CGI_DONE;
-#if 0
-    esp_err_t err = sas8KeeperReadAsync(sas8RequestQueue, pdMS_TO_TICKS(150), &status, &co2);
-    SemaphoreHandle_t done;
-    TimerHandle_t tTimeout;
-    esp_err_t err = sas8KeeperReadAsync(sas8RequestQueue, pdMS_TO_TICKS(150), &done, &tTimeout);
-    if (err != ESP_OK) {
-        ESP_LOGE(LOG_TAG, "sas8ReadStatusCO2(...) err: 0x%x (%s).",
-                 (int)err, (char*)esp_err_to_name(err));
-        httpdStartResponse(connData, 503);
-        httpdEndHeaders(connData);
-        return HTTPD_CGI_DONE;
-    }
-    if (xSemaphoreTake(done, portMAX_DELAY) != pdPASS) {
-        ESP_LOGE(LOG_TAG, "xSemaphoreTake(done): !pdPASS");
-        abort();
-    }
-    // TODO: find the way to delete timer.
-    // if (xTimerDelete(tTimeout, 0) != pdPASS) {
-    //     ESP_LOGE(LOG_TAG, "xTimerDelete(tTimeout): !pdPASS");
-    //     abort();
-    // }
-    ESP_LOGI(LOG_TAG, "Status: 0x%04x; CO2: % 4d", status, co2);
-#endif
 }
 
-#if 0
-static void updateConsole(void *arg) {
-    QueueHandle_t queue = (QueueHandle_t)arg;
-    if (queue == NULL) {
-        ESP_LOGE("updateConsole", "queue == NULL");
-        abort();
-    }
+static void updateConsole(void *unused_arg) {
+    static const char* log_tag = __func__;
+
     for(;;vTaskDelay(pdMS_TO_TICKS(14000))) {
-        uint16_t status, co2;
-        esp_err_t err = sas8KeeperRead(sas8RequestQueue, pdMS_TO_TICKS(150), &status, &co2);
+        QueueHandle_t done;
+        TimerHandle_t tTimeout;
+        esp_err_t err = SAS8ReadStatusCO2Async(pdMS_TO_TICKS(150), &done, &tTimeout);
         if (err != ESP_OK) {
-            ESP_LOGE("updateConsole", "sas8ReadStatusCO2(...) err: 0x%x (%s).",
+            ESP_LOGE(log_tag, "SAS8ReadStatusCO2Async(...) err: 0x%x (%s).",
                      (int)err, (char*)esp_err_to_name(err));
             continue;
         }
-        ESP_LOGI(LOG_TAG, "Status: 0x%04x; CO2: % 4d", status, co2);
+        SAS8GKStatusCO2Response response;
+        if (xQueueReceive(done, &response, portMAX_DELAY) != pdPASS) {
+            ESP_LOGE(log_tag, "xQueueReceive(done): !pdPASS");
+            // TODO: release resources.
+            continue;
+        }
+        GKTimerCancel(tTimeout);
+        vQueueDelete(done);
+        ESP_LOGI("queue", "- %p", done);
+        if (response.gk_resp.err != ESP_OK) {
+            ESP_LOGE(log_tag, "response.gk_resp.err err: 0x%x (%s).",
+                     (int)response.gk_resp.err, (char*)esp_err_to_name(response.gk_resp.err));
+            continue;
+        }
+        ESP_LOGI(log_tag, "Status: 0x%04x; CO2: % 4d", response.result.status, response.result.co2);
     }
 }
-#endif
 
 
 #define LISTEN_PORT     80u
@@ -763,7 +591,7 @@ const HttpdBuiltInUrl builtInUrls[]={
 	ROUTE_END(),
 };
 
-#define MASTER_TAG LOG_TAG
+#define MASTER_TAG "sas8"
 
 #define MASTER_CHECK(a, ret_val, str, ...) \
     if (!(a)) { \
@@ -829,9 +657,7 @@ void app_main(void)
         abort();
     }
     xTaskCreate(GatekeeperTask, "sas8Gatekeeper", 2048, (void *)&sas8GKArgs, 1, NULL);
-#if 0
-    xTaskCreate(updateConsole, "updateConsole", 2048, (void *)sas8RequestQueue, 1, NULL);
-#endif
+    xTaskCreate(updateConsole, "updateConsole", 2048, NULL, 1, NULL);
 
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
