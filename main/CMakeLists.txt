@@ -8,4 +8,5 @@ idf_component_register(
         "freemodbus"
         "libesphttpd"
         "nvs_flash"
+        "bme680"
 )

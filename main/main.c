@@ -27,6 +27,7 @@
 
 #include <esp_modbus_master.h>
 #include <driver/gpio.h>
+#include <bme680.h>
 #include "sas8.h"
 
 // Note on terminology
@@ -104,6 +105,9 @@ bool gkExecResultStack(GKRequest *req, void *op_args);
 bool gkExecResultHeap(GKRequest *req, void *op_args);
 bool gkExecDone(GKRequest *req, void *result);
 bool gkError(GKRequest *req, esp_err_t err);
+static void gkTimeoutFunc(TimerHandle_t xTimer);
+static esp_err_t GKSendRequest(QueueHandle_t request_q, GKRequest *request, TickType_t timeoutTicks, TimerHandle_t *timeoutTimer);
+static esp_err_t GKSendRequestQ(QueueHandle_t request_q, GKRequest *request, TickType_t timeoutTicks, QueueHandle_t *response_q, TimerHandle_t *timeoutTimer);
 
 static void GatekeeperTask(void *arg) {
     static const char* log_tag = __func__;
@@ -283,7 +287,28 @@ bool gkExecDone(GKRequest *req, void *result) {
     return true;
 }
 
-static void gkTimeout(TimerHandle_t xTimer) {
+esp_err_t gkTimeout(const TickType_t timeoutTicks, GKRequest *request, TimerHandle_t *timeoutTimer) {
+    static const char* log_tag = __func__;
+    *timeoutTimer = xTimerCreate("gkTimeout", timeoutTicks, pdFALSE /* uxAutoReload */, request, gkTimeoutFunc);
+    if (*timeoutTimer == NULL) {
+        ESP_LOGE(log_tag, "xTimerCreate(): NULL");
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI("timer", "+ %p", *timeoutTimer);
+    if (xTimerStart(*timeoutTimer, 0) != pdPASS) {
+        ESP_LOGE(log_tag, "xTimerStart(timeoutTimer): !pdPASS");
+
+        ESP_LOGI("timer", "- %p", *timeoutTimer);
+        if (xTimerDelete(*timeoutTimer, 0) != pdPASS) {
+            ESP_LOGE(log_tag, "xTimerDelete(timeoutTimer) != pdPASS");
+        }
+
+        return ESP_ERR_INVALID_STATE;
+    }
+    return ESP_OK;
+}
+
+static void gkTimeoutFunc(TimerHandle_t xTimer) {
     static const char* log_tag = __func__;
     GKRequest *req = (GKRequest *)pvTimerGetTimerID(xTimer);
     if (req == NULL) {
@@ -323,7 +348,7 @@ static void gkTimeout(TimerHandle_t xTimer) {
 
 // gkTimerCancelFunc deletes the gatekeeper timeout timer. It must execute in
 // the context of FreeRTOS timer task to ensure serialised execution of
-// gkTimeout and gkTimerCancelFunc.
+// gkTimeoutFunc and gkTimerCancelFunc.
 static void gkTimerCancelFunc(void *timerParam, uint32_t param2) {
     static const char* log_tag = __func__;
     TimerHandle_t timer = timerParam;
@@ -337,8 +362,9 @@ static void gkTimerCancelFunc(void *timerParam, uint32_t param2) {
     // Timer removal is a deferred operation - xTimerDelete only queues request
     // to delete the timer but does not delete it immediately. So even though
     // we call xTimerDelete here it is still possible for timer to expire and
-    // execute gkTimeout. Setting TimerID to NULL here ensures that gkTimeout
-    // won't attempt to free memory and delete sync semaphore second time.
+    // execute gkTimeoutFunc. Setting TimerID to NULL here ensures that
+    // gkTimeoutFunc won't attempt to free memory and delete sync semaphore
+    // second time.
     vTimerSetTimerID(timer, NULL);
 
     ESP_LOGI("timer", "- %p", timer);
@@ -366,26 +392,78 @@ static BaseType_t GKTimerCancel(TimerHandle_t timer) {
     return xTimerPendFunctionCall(gkTimerCancelFunc, timer, 0, 0);
 }
 
+static esp_err_t GKSendRequestQ(QueueHandle_t request_q, GKRequest *request, TickType_t timeoutTicks, QueueHandle_t *response_q, TimerHandle_t *timeoutTimer) {
+    static const char* log_tag = __func__;
+    *response_q = xQueueCreate(1, request->response_size);
+    if (response_q == NULL) {
+        ESP_LOGE(log_tag, "xQueueCreate() == NULL");
+        return ESP_ERR_INVALID_STATE;
+    }
+    request->response_q = *response_q;
+    ESP_LOGI("queue", "+ %p", *response_q);
+    esp_err_t err = GKSendRequest(request_q, request, timeoutTicks, timeoutTimer);
+    if (err != ESP_OK) {
+        vQueueDelete(*response_q);
+        ESP_LOGI("queue", "- %p", *response_q);
+    }
+    return err;
+}
+
+static esp_err_t GKSendRequest(QueueHandle_t request_q, GKRequest *request, TickType_t timeoutTicks, TimerHandle_t *timeoutTimer) {
+    static const char* log_tag = __func__;
+    request->sync = xSemaphoreCreateBinary();
+    if (request->sync == NULL) {
+        ESP_LOGE(log_tag, "xSemaphoreCreateBinary() == NULL");
+        return ESP_ERR_INVALID_STATE;
+    }
+    ESP_LOGI("semaphore", "+ %p", request->sync);
+    if (xSemaphoreGive(request->sync) != pdPASS) {
+        ESP_LOGE(log_tag, "xSemaphoreGive(request->sync) != pdPASS");
+        ESP_LOGI("semaphore", "- %p", request->sync);
+        vSemaphoreDelete(request->sync);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t err = gkTimeout(timeoutTicks, (GKRequest *) request, timeoutTimer);
+    if (err != ESP_OK) {
+        ESP_LOGE(log_tag, "gkTimeout(...) err: 0x%x (%s).",
+                 (int)err, (char*)esp_err_to_name(err));
+        ESP_LOGI("semaphore", "- %p", request->sync);
+        vSemaphoreDelete(request->sync);
+        return err;
+    }
+
+    if (xQueueSend(request_q, request, 0) != pdPASS) {
+        ESP_LOGE(log_tag, "xQueueSend(): !pdPASS");
+        ESP_LOGI("semaphore", "- %p", request->sync);
+        vSemaphoreDelete(request->sync);
+        GKTimerCancel(timeoutTimer);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    return ESP_OK;
+}
+
 static volatile GKTaskArgs sas8GKArgs;
 
 typedef struct {
     uint8_t sensor_addr;
-} SAS8StatusCO2Request;
+} SAS8StatusCO2Args;
 
 typedef struct {
     GKRequest gk_req;
-    SAS8StatusCO2Request args;
+    SAS8StatusCO2Args args;
 } SAS8GKStatusCO2Request;
 
 typedef struct {
     esp_err_t err;
     uint16_t status;
     uint16_t co2;
-} SAS8StatusCO2Response;
+} SAS8StatusCO2Result;
 
 typedef struct {
     GKResponseStack gk_resp;
-    SAS8StatusCO2Response result;
+    SAS8StatusCO2Result result;
 } SAS8GKStatusCO2Response;
 
 
@@ -397,19 +475,20 @@ void dummy_op(void *args, void *result, size_t result_size) {
 void sas8ReadStatusCO2Op(void *args, void *result, size_t result_size) {
     static const char* log_tag = __func__;
     ESP_LOGI(log_tag, "args: %p; result: %p; result_size: %d", args, result, result_size);
-    SAS8StatusCO2Request *a = (SAS8StatusCO2Request*) args;
+    SAS8StatusCO2Args *a = (SAS8StatusCO2Args*) args;
     ESP_LOGI(log_tag, "sensor_addr: %d", a->sensor_addr);
-    SAS8StatusCO2Response *r = (SAS8StatusCO2Response*) result;
+    SAS8StatusCO2Result *r = (SAS8StatusCO2Result*) result;
     r->err = sas8ReadStatusCO2(a->sensor_addr, &r->status, &r->co2);
+    ESP_LOGI(log_tag, "Status: 0x%04x; CO2: % 4d", r->status, r->co2);
 }
 
-// TODO: Decide what would be better in relation to timeout.
-static esp_err_t SAS8ReadStatusCO2Async(TickType_t xTicksToWait, QueueHandle_t *response_q, TimerHandle_t *tTimeout) {
+static esp_err_t SAS8ReadStatusCO2Async(TickType_t timeoutTicks, QueueHandle_t *response_q, TimerHandle_t *timeoutTimer) {
     static const char* log_tag = __func__;
 
     SAS8GKStatusCO2Request *request = malloc(sizeof(SAS8GKStatusCO2Request));
     if (request == NULL) {
-        // TODO
+        ESP_LOGE(log_tag, "malloc(sizeof(SAS8GKStatusCO2Request)) == NULL");
+        return ESP_ERR_NO_MEM;
     }
     ESP_LOGI("heap", "+ %p", request);
     request->gk_req.op = sas8ReadStatusCO2Op;
@@ -421,47 +500,12 @@ static esp_err_t SAS8ReadStatusCO2Async(TickType_t xTicksToWait, QueueHandle_t *
     request->gk_req.result_offset = offsetof(SAS8GKStatusCO2Response, result);
     request->args.sensor_addr = 104;
 
-    // // // // // // // // //
-    *tTimeout = xTimerCreate("gatekeeper timeout", xTicksToWait, pdFALSE /* uxAutoReload */, request, gkTimeout);
-    if (*tTimeout == NULL) {
-        // TODO: release resources
-        ESP_LOGE(log_tag, "xTimerCreate(): NULL");
-        return ESP_ERR_NO_MEM;
+    esp_err_t err = GKSendRequestQ(sas8GKArgs.q, (GKRequest *)request, timeoutTicks, response_q, timeoutTimer);
+    if (err != ESP_OK) {
+        ESP_LOGI("heap", "- %p", request);
+        free(request);
     }
-    ESP_LOGI("timer", "+ %p", *tTimeout);
-    if (xTimerStart(*tTimeout, 0) != pdPASS) {
-        ESP_LOGE(log_tag, "xTimerStart(tTimeout): !pdPASS");
-        // TODO: release resources
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    // // // // // // // // //
-    *response_q = xQueueCreate(1, sizeof(SAS8GKStatusCO2Response));
-    if (response_q == NULL) {
-        // TODO
-    }
-    request->gk_req.response_q = *response_q;
-    ESP_LOGI("queue", "+ %p", *response_q);
-
-    // // // // // // // // //
-    request->gk_req.sync = xSemaphoreCreateBinary();
-    if (request->gk_req.sync == NULL) {
-        // TODO
-    }
-    ESP_LOGI("semaphore", "+ %p", request->gk_req.sync);
-    if (xSemaphoreGive(request->gk_req.sync) != pdPASS) {
-        // TODO: release resources
-        ESP_LOGE(log_tag, "xSemaphoreGive(req.sync): !pdPASS");
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    if (xQueueSend(sas8GKArgs.q, request, 0) != pdPASS) {
-        ESP_LOGE(log_tag, "xQueueSend(): !pdPASS");
-        // TODO: release resources
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    return ESP_OK;
+    return err;
 }
 
 static void disconnect_handler(void* arg, esp_event_base_t event_base, 
@@ -496,7 +540,6 @@ CgiStatus ICACHE_FLASH_ATTR handleMetrics(HttpdConnData *connData) {
     }
 
     ESP_LOGI(log_tag, "sending request");
-    // uint16_t status=0, co2=0;
 
     // // // // // // // // //
     QueueHandle_t done;
@@ -624,7 +667,7 @@ static esp_err_t master_init(void)
                             (uint32_t)err);
 
     // Set UART pin numbers
-    err = uart_set_pin(UART_NUM_1, GPIO_NUM_33, GPIO_NUM_23,
+    err = uart_set_pin(UART_NUM_1, GPIO_NUM_21, GPIO_NUM_25,
                        UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 
     err = mbc_master_start();
@@ -644,9 +687,98 @@ static esp_err_t master_init(void)
     return err;
 }
 
+// user task stack depth for ESP32
+#define TASK_STACK_DEPTH 2048
+
+// I2C interface defintions for ESP32 and ESP8266
+#define I2C_BUS       0
+#define I2C_SCL_PIN   22
+#define I2C_SDA_PIN   19
+#define I2C_FREQ      I2C_FREQ_100K
+
+/* -- user tasks --------------------------------------------------- */
+
+static bme680_sensor_t* sensor = 0;
+
+/*
+ * User task that triggers measurements of sensor every seconds. It uses
+ * function *vTaskDelay* to wait for measurement results. Busy wating
+ * alternative is shown in comments
+ */
+void user_task(void *pvParameters)
+{
+    bme680_values_float_t values;
+
+    TickType_t last_wakeup = xTaskGetTickCount();
+
+    // as long as sensor configuration isn't changed, duration is constant
+    uint32_t duration = bme680_get_measurement_duration(sensor);
+
+    while (1) {
+        // trigger the sensor to start one TPHG measurement cycle
+        if (bme680_force_measurement (sensor))
+        {
+            // passive waiting until measurement results are available
+            vTaskDelay (duration);
+
+            // alternatively: busy waiting until measurement results are available
+            // while (bme680_is_measuring (sensor)) ;
+
+            // get the results and do something with them
+            if (bme680_get_results_float (sensor, &values))
+                printf("%.3f BME680 Sensor: %.2f °C, %.2f %%, %.2f hPa, %.2f Ohm\n",
+                       (double)sdk_system_get_time()*1e-3,
+                       values.temperature, values.humidity,
+                       values.pressure, values.gas_resistance);
+        }
+        // passive waiting until 1 second is over
+        vTaskDelayUntil(&last_wakeup, 10000 / portTICK_PERIOD_MS);
+    }
+}
+
 void app_main(void)
 {
     static const char* log_tag = __func__;
+
+    // BME680
+
+    /** -- MANDATORY PART -- */
+
+    // Init all I2C bus interfaces at which BME680 sensors are connected
+    i2c_init(I2C_BUS, I2C_SCL_PIN, I2C_SDA_PIN, I2C_FREQ);
+
+    // init the sensor with slave address BME680_I2C_ADDRESS_2 connected to I2C_BUS.
+    sensor = bme680_init_sensor (I2C_BUS, BME680_I2C_ADDRESS_2, 0);
+
+    if (sensor) {
+        /** -- SENSOR CONFIGURATION PART (optional) --- */
+
+        // Changes the oversampling rates to 4x oversampling for temperature
+        // and 2x oversampling for humidity. Pressure measurement is skipped.
+        // bme680_set_oversampling_rates(sensor, osr_4x, osr_none, osr_2x);
+        bme680_set_oversampling_rates(sensor, osr_4x, osr_4x, osr_4x);
+
+        // Change the IIR filter size for temperature and pressure to 7.
+        bme680_set_filter_size(sensor, iir_size_7);
+
+        // Change the heater profile 0 to 200 degree Celcius for 100 ms.
+        //bme680_set_heater_profile (sensor, 0, 200, 100);
+        //bme680_use_heater_profile (sensor, 0);
+        bme680_use_heater_profile(sensor, BME680_HEATER_NOT_USED);
+
+        // Set ambient temperature to 10 degree Celsius
+        bme680_set_ambient_temperature (sensor, 22);
+
+        /** -- TASK CREATION PART --- */
+
+        // must be done last to avoid concurrency situations with the sensor 
+        // configuration part
+
+        // Create a task that uses the sensor
+        xTaskCreate(user_task, "user_task", TASK_STACK_DEPTH, NULL, 2, NULL);
+    } else {
+        printf("Could not initialize BME680 sensor\n");
+    }
 
     ESP_ERROR_CHECK(master_init());
 
