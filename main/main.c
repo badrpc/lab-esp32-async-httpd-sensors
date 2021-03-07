@@ -11,6 +11,7 @@
 #include <esp_event.h>
 #include <esp_log.h>
 #include <esp_system.h>
+#include <esp_timer.h>
 #include <nvs_flash.h>
 #include <sys/param.h>
 #include "esp_netif.h"
@@ -27,8 +28,18 @@
 
 #include <esp_modbus_master.h>
 #include <driver/gpio.h>
-#include <bme680.h>
+#include <driver/i2c.h>
 #include "sas8.h"
+
+#define BME680_BSEC
+
+#ifdef BME680_OPENSOURCE
+#include <bme680.h>
+#endif
+#ifdef BME680_BSEC
+#include <bsec_integration.h>
+#include <bsec_serialized_configurations_iaq.h>
+#endif
 
 // Note on terminology
 //
@@ -698,8 +709,11 @@ static esp_err_t master_init(void)
 
 /* -- user tasks --------------------------------------------------- */
 
+#ifdef BME680_OPENSOURCE
 static bme680_sensor_t* sensor = 0;
+#endif
 
+#ifdef BME680_OPENSOURCE
 /*
  * User task that triggers measurements of sensor every seconds. It uses
  * function *vTaskDelay* to wait for measurement results. Busy wating
@@ -707,9 +721,9 @@ static bme680_sensor_t* sensor = 0;
  */
 void user_task(void *pvParameters)
 {
-    bme680_values_float_t values;
-
     TickType_t last_wakeup = xTaskGetTickCount();
+
+    bme680_values_float_t values;
 
     // as long as sensor configuration isn't changed, duration is constant
     uint32_t duration = bme680_get_measurement_duration(sensor);
@@ -735,12 +749,246 @@ void user_task(void *pvParameters)
         vTaskDelayUntil(&last_wakeup, 10000 / portTICK_PERIOD_MS);
     }
 }
+#endif
+
+#ifdef BME680_BSEC
+
+#define I2C_ACK_VAL  0x0
+#define I2C_NACK_VAL 0x1
+
+/*!
+ * @brief           Write operation in either I2C or SPI
+ *
+ * param[in]        dev_addr        I2C or SPI device address
+ * param[in]        reg_addr        register address
+ * param[in]        reg_data_ptr    pointer to the data to be written
+ * param[in]        data_len        number of bytes to be written
+ *
+ * @return          result of the bus communication function
+ */
+int8_t bus_write(uint8_t dev_addr, uint8_t reg_addr, uint8_t *reg_data_ptr, uint16_t data_len)
+{
+    // ...
+    // Please insert system specific function to write to the bus where BME680 is connected
+    // ...
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, dev_addr << 1 | I2C_MASTER_WRITE, true);
+
+    i2c_master_write_byte(cmd, reg_addr, true);
+
+    if (reg_data_ptr) {
+        i2c_master_write(cmd, reg_data_ptr, data_len, true);
+    }
+    i2c_master_stop(cmd);
+    esp_err_t err = i2c_master_cmd_begin(/* bus */ 0, cmd, pdMS_TO_TICKS(1000));
+    i2c_cmd_link_delete(cmd);
+
+    return err;
+}
+
+/*!
+ * @brief           Read operation in either I2C or SPI
+ *
+ * param[in]        dev_addr        I2C or SPI device address
+ * param[in]        reg_addr        register address
+ * param[out]       reg_data_ptr    pointer to the memory to be used to store the read data
+ * param[in]        data_len        number of bytes to be read
+ *
+ * @return          result of the bus communication function
+ */
+int8_t bus_read(uint8_t dev_addr, uint8_t reg_addr, uint8_t *reg_data_ptr, uint16_t data_len)
+{
+    // ...
+    // Please insert system specific function to read from bus where BME680 is connected
+    // ...
+    if (data_len == 0) return true;
+
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, ( dev_addr << 1 ) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, reg_addr, true);
+    if (!reg_data_ptr) {
+        i2c_master_stop(cmd);
+    }
+
+    if (reg_data_ptr)
+    {
+        i2c_master_start(cmd);
+        i2c_master_write_byte(cmd, ( dev_addr << 1 ) | I2C_MASTER_READ, true);
+        if (data_len > 1) {
+            i2c_master_read(cmd, reg_data_ptr, data_len-1, I2C_ACK_VAL);
+        }
+        i2c_master_read_byte(cmd, reg_data_ptr + data_len-1, I2C_NACK_VAL);
+        i2c_master_stop(cmd);
+    }
+    esp_err_t err = i2c_master_cmd_begin(/* bus */ 0, cmd, pdMS_TO_TICKS(1000));
+    i2c_cmd_link_delete(cmd);
+
+    return err;
+}
+
+/*!
+ * @brief           System specific implementation of sleep function
+ *
+ * @param[in]       t_ms    time in milliseconds
+ *
+ * @return          none
+ */
+void local_sleep(uint32_t t_ms)
+{
+    // ...
+    // Please insert system specific function sleep or delay for t_ms milliseconds
+    // ...
+    vTaskDelay(pdMS_TO_TICKS(t_ms));
+}
+
+/*!
+ * @brief           Capture the system time in microseconds
+ *
+ * @return          system_current_time    current system timestamp in microseconds
+ */
+int64_t get_timestamp_us()
+{
+    // int64_t system_current_time = 0;
+    // ...
+    // Please insert system specific function to retrieve a timestamp (in microseconds)
+    // ...
+    return esp_timer_get_time();
+    // return system_current_time;
+}
+
+/*!
+ * @brief           Handling of the ready outputs
+ *
+ * @param[in]       timestamp       time in nanoseconds
+ * @param[in]       iaq             IAQ signal
+ * @param[in]       iaq_accuracy    accuracy of IAQ signal
+ * @param[in]       temperature     temperature signal
+ * @param[in]       humidity        humidity signal
+ * @param[in]       pressure        pressure signal
+ * @param[in]       raw_temperature raw temperature signal
+ * @param[in]       raw_humidity    raw humidity signal
+ * @param[in]       gas             raw gas sensor signal
+ * @param[in]       bsec_status     value returned by the bsec_do_steps() call
+ *
+ * @return          none
+ */
+void output_ready(int64_t timestamp, float iaq, uint8_t iaq_accuracy, float temperature, float humidity,
+     float pressure, float raw_temperature, float raw_humidity, float gas, bsec_library_return_t bsec_status,
+     float static_iaq, float co2_equivalent, float breath_voc_equivalent)
+{
+    // const char *log_tag = "BSEC output";
+    // ...
+    // Please insert system specific code to further process or display the BSEC outputs
+    // ...
+    // ESP_LOGI(log_tag, "timestamp: %lld, iaq: %f, iaq_accuracy: %d, temperature: %f, humidity: %f, pressure: %f, raw_temperature: %f, raw_humidity: %f, gas: %f, static_iaq: %f, co2: %f, voc: %f", timestamp, iaq, iaq_accuracy, temperature, humidity, pressure, raw_temperature, raw_humidity, gas, static_iaq, co2_equivalent, breath_voc_equivalent);
+    printf("timestamp: %lld, iaq: %f, iaq_accuracy: %d, temperature: %f, humidity: %f, pressure: %f, raw_temperature: %f, raw_humidity: %f, gas: %f, static_iaq: %f, co2: %f, voc: %f\n", timestamp, iaq, iaq_accuracy, temperature, humidity, pressure, raw_temperature, raw_humidity, gas, static_iaq, co2_equivalent, breath_voc_equivalent);
+}
+
+/*!
+ * @brief           Load previous library state from non-volatile memory
+ *
+ * @param[in,out]   state_buffer    buffer to hold the loaded state string
+ * @param[in]       n_buffer        size of the allocated state buffer
+ *
+ * @return          number of bytes copied to state_buffer
+ */
+uint32_t state_load(uint8_t *state_buffer, uint32_t n_buffer)
+{
+    // ...
+    // Load a previous library state from non-volatile memory, if available.
+    //
+    // Return zero if loading was unsuccessful or no state was available, 
+    // otherwise return length of loaded state string.
+    // ...
+    return 0;
+}
+
+/*!
+ * @brief           Save library state to non-volatile memory
+ *
+ * @param[in]       state_buffer    buffer holding the state to be stored
+ * @param[in]       length          length of the state string to be stored
+ *
+ * @return          none
+ */
+void state_save(const uint8_t *state_buffer, uint32_t length)
+{
+    // ...
+    // Save the string some form of non-volatile memory, if possible.
+    // ...
+}
+ 
+/*!
+ * @brief           Load library config from non-volatile memory
+ *
+ * @param[in,out]   config_buffer    buffer to hold the loaded state string
+ * @param[in]       n_buffer        size of the allocated state buffer
+ *
+ * @return          number of bytes copied to config_buffer
+ */
+uint32_t config_load(uint8_t *config_buffer, uint32_t n_buffer)
+{
+    // ...
+    // Load a library config from non-volatile memory, if available.
+    //
+    // Return zero if loading was unsuccessful or no config was available, 
+    // otherwise return length of loaded config string.
+    // ...
+    if (sizeof(bsec_config_iaq) < n_buffer) {
+        printf("config_load: buffsizeof(bsec_config_iaq)r too small: need %d, provided %d\n", sizeof(bsec_config_iaq), n_buffer);
+        return 0;
+    }
+    printf("config_load: %d bytes\n", sizeof(bsec_config_iaq));
+    memcpy(config_buffer, bsec_config_iaq, sizeof(bsec_config_iaq));
+    return sizeof(bsec_config_iaq);
+}
+
+void user_task(void *pvParameters)
+{
+    i2c_config_t conf;
+    conf.mode = I2C_MODE_MASTER;
+    conf.sda_io_num = I2C_SDA_PIN;
+    conf.scl_io_num = I2C_SCL_PIN;
+    conf.sda_pullup_en = GPIO_PULLUP_ENABLE;
+    conf.scl_pullup_en = GPIO_PULLUP_ENABLE;
+    conf.master.clk_speed = 1000000;
+    i2c_param_config(/* bus */ 0, &conf);
+    i2c_driver_install(/* bus */ 0, I2C_MODE_MASTER, 0, 0, 0);
+
+    // BME680 via proprietary Bosch library
+    // https://github.com/BoschSensortec/BME68x-Sensor-API
+    // https://www.bosch-sensortec.com/software-tools/software/bsec/
+    return_values_init ret;
+
+    /* Call to the function which initializes the BSEC library 
+     * Switch on low-power mode and provide no temperature offset */
+    ret = bsec_iot_init(BSEC_SAMPLE_RATE_LP, 4.0f, bus_write, bus_read, local_sleep, state_load, config_load);
+    if (ret.bme680_status)
+    {
+        /* Could not intialize BME680 */
+        printf("(BSEC) Could not initialize BME680 sensor\n");
+    }
+    else if (ret.bsec_status)
+    {
+        /* Could not intialize BSEC library */
+        printf("(BSEC) Could not initialize BSEC library\n");
+    }
+
+    /* Call to endless loop function which reads and processes data based on sensor settings */
+    /* State is saved every 10.000 samples, which means every 10.000 * 3 secs = 500 minutes  */
+    bsec_iot_loop(local_sleep, get_timestamp_us, output_ready, state_save, 10000);
+}
+#endif
 
 void app_main(void)
 {
     static const char* log_tag = __func__;
 
-    // BME680
+#ifdef BME680_OPENSOURCE
+    // BME680 via open-source library https://github.com/gschorcht/bme680-esp-idf
 
     /** -- MANDATORY PART -- */
 
@@ -779,6 +1027,11 @@ void app_main(void)
     } else {
         printf("Could not initialize BME680 sensor\n");
     }
+#endif
+
+#ifdef BME680_BSEC
+    xTaskCreate(user_task, "user_task", 8192, NULL, 2, NULL);
+#endif
 
     ESP_ERROR_CHECK(master_init());
 
